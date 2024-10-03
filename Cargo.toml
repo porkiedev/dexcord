@@ -21,3 +21,11 @@ thiserror = "1.0"
 
 [build-dependencies]
 prost-build = "0.13"
+
+# Optimize release binary
+[profile.release]
+opt-level = 2
+lto = "fat"
+# Optimize release dependencies
+[profile.release.package."*"]
+opt-level = 2

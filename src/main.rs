@@ -86,20 +86,13 @@ async fn main() -> Result<()> {
 }
 
 fn format_status(value: u32) -> String {
-    if (40..60).contains(&value) {
-        format!("I'm in sugar withdrawls, send help ({value} mg/dL)")
-    }
-    else if (60..80).contains(&value) {
-        format!("Tell me to eat something, I'm a little low ({value} mg/dL)")
-    }
-    else if (80..200).contains(&value) {
-        format!("We chillin ({value} mg/dL)")
-    }
-    else if (200..300).contains(&value) {
-        format!("I'm a little high, tell me to do some pushups ({value} mg/dL)")
-    }
-    else {
-        format!("I'm currently ODing on sugar, send help ({value} mg/dL)")
+    match value {
+        ..40 => format!("I'm currently dying, send help ({value} mg/dL)"),
+        40..60 => format!("I'm in sugar withdrawls, send help ({value} mg/dL)"),
+        60..80 => format!("Tell me to eat something, I'm a little low ({value} mg/dL)"),
+        80..200 => format!("We chillin ({value} mg/dL)"),
+        200..300 => format!("I'm a little high, tell me to do some pushups ({value} mg/dL)"),
+        300.. => format!("I'm currently ODing on sugar, send help ({value} mg/dL)")
     }
 }
 
