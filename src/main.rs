@@ -62,8 +62,8 @@ async fn main() -> Result<()> {
             },
             Err(e) => {
 
-                // If the session expired, just continue
-                if let Some(&dexcom::Error::SessionInvalid) = e.downcast_ref::<dexcom::Error>() {
+                // If the session expired or is not found, just continue
+                if let Some(&dexcom::Error::SessionInvalid | &dexcom::Error::SessionNotFound) = e.downcast_ref::<dexcom::Error>() {
                     debug!("The dexcom session ID expired. Retrying with a new session ID...");
                     // Reset the loop flag so we instantly retry
                     loop_has_started = false;
