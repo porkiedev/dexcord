@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
 
     // Create the API instances
     let discord_api = discord::Api::new(&config.discord_token).await;
-    let mut dexcom_api = dexcom::Api::new(&config.dexcom_username, &config.dexcom_password).await.unwrap();
+    let mut dexcom_api = dexcom::Api::new(&config.dexcom_username, &config.dexcom_password).await?;
 
     // A flag used to update the status immediately on the first loop iteration
     let mut loop_has_started = false;
@@ -50,13 +50,12 @@ async fn main() -> Result<()> {
         // Get a blood sugar measurement
         let status_string = match dexcom_api.get_latest_glucose().await {
             Ok(measurement) => {
-                // If the API returned an empty response, log a warning and continue
-                if measurement.is_none() {
+
+                // Get the measurement if it exists
+                let Some(measurement) = measurement else {
                     warn!("The API didn't return a glucose measurement");
                     continue;
-                }
-                // Shadow the measurement variable
-                let measurement = measurement.unwrap();
+                };
                 trace!("Successfully got glucose measurement: {}", measurement.value);
                 // Return the status string
                 format_status(measurement.value)
@@ -85,6 +84,7 @@ async fn main() -> Result<()> {
 
 }
 
+/// Formats a glucose value into a string that can be used to update the discord account status
 fn format_status(value: u32) -> String {
     match value {
         ..40 => format!("I'm currently dying, send help ({value} mg/dL)"),
