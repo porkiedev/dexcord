@@ -34,18 +34,16 @@ async fn main() -> Result<()> {
     // Create the API instances
     let discord_api = discord::Api::new(&config.discord_token).await;
     let mut dexcom_api = dexcom::Api::new(&config.dexcom_username, &config.dexcom_password).await?;
-
-    // A flag used to update the status immediately on the first loop iteration
-    let mut loop_has_started = false;
+    
+    // How long (in seconds) should we wait between each loop iteration. This is set to 5 minutes by default but
+    // may be temporarily changed to something shorter if we need to query the dexcom API for a new session ID
+    let mut loop_wait_time = 0;
 
     loop {
-        
-        // Sleep for 5 minutes. This doesn't apply to the first loop iteration since that's the first one
-        if loop_has_started {
-            tokio::time::sleep(Duration::from_secs(300)).await;
-        }
-        // Update the loop flag since we just started
-        loop_has_started = true;
+        // Sleep for the specified amount of time
+        tokio::time::sleep(Duration::from_secs(loop_wait_time)).await;
+        // Reset the wait time to 5 minutes
+        loop_wait_time = 300;
 
         // Get a blood sugar measurement
         let status_string = match dexcom_api.get_latest_glucose().await {
@@ -65,8 +63,8 @@ async fn main() -> Result<()> {
                 // If the session expired or is not found, just continue
                 if let Some(&dexcom::Error::SessionInvalid | &dexcom::Error::SessionNotFound) = e.downcast_ref::<dexcom::Error>() {
                     debug!("The dexcom session ID expired. Retrying with a new session ID...");
-                    // Reset the loop flag so we instantly retry
-                    loop_has_started = false;
+                    // Lower the wait time to 10 seconds so we get a new session quickly but don't spam the API
+                    loop_wait_time = 10;
                     continue;
                 } else {
                     error!("Failed to get latest glucose measurement: {e:?}");

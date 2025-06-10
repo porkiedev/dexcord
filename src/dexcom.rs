@@ -193,7 +193,7 @@ impl ApiCache {
         // Open the cache file
         let file = File::open(path);
 
-        // If the file doesn't exist or we can't open it, return None (i.e. create a new cache)
+        // If the file doesn't exist, or we can't open it, return None (i.e. create a new cache)
         if let Err(e) = file {
             warn!("Failed to open the API cache file: {e:?}");
             return None;
@@ -204,9 +204,13 @@ impl ApiCache {
         let cached_s: Self = serde_json::from_reader(file)
         .context("The API cache is invalid (perhaps try deleting it)")
         .unwrap();
-
-        // The username changed. The cache should be refreshed
-        if cached_s.username != username {
+        
+        // The cache file exists but the username changed/one or more of the fields are empty.
+        // This means the cache is invalid and needs to be refreshed
+        if cached_s.username != username ||
+            cached_s.username.is_empty() ||
+            cached_s.account_id.is_empty() ||
+            cached_s.session_id.is_empty() {
             None
         }
         // The cache is still valid, so return it
