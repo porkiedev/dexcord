@@ -40,50 +40,54 @@ async fn main() -> Result<()> {
     let dexcom_api = dexcom::Api::new(&config).await?;
     let db = database::Database::new(&config);
 
-    // How long (in seconds) should we wait between each loop iteration. This is set to 5 minutes by default but
+    // How long (in seconds) should we wait between each loop iteration. This is set to 2 minutes by default but
     // may be temporarily changed to something shorter if we need to query the dexcom API for a new session ID
     let mut loop_wait_time = 0;
-
+    // The last glucose value we received. This is used so we only update the discord account status if the value has changed
+    let mut last_value = 0;
+    
     loop {
         // Sleep for the specified amount of time
         tokio::time::sleep(Duration::from_secs(loop_wait_time)).await;
-        // Reset the wait time to 5 minutes
-        loop_wait_time = 240;
+        // Reset the wait time to 2 minutes
+        loop_wait_time = 120;
 
-        // Get a blood sugar measurement
-        let status_string = match dexcom_api.get_latest_glucose(&config, &mut cache).await {
-            Ok(measurement) => {
-
-                // Get the measurement if it exists
-                let Some(measurement) = measurement else {
-                    warn!("The API didn't return a glucose measurement");
-                    continue;
-                };
-
-                trace!("Successfully got glucose measurement: {}", measurement.value);
-                // Format the status string
-                let status_string = format_status(measurement.value);
-                // Insert the glucose measurement into the database, ignoring any errors
-                // as the database logs them, and we don't want to crash the app
-                let _ = db.insert_glucose(&config, &mut cache, measurement).await;
-
-                // Return the status string
-                status_string
-            },
-            Err(e) => {
-
-                // The dexcom module will log the error for us, so we just need to retry
-                debug!("Retrying in 10 seconds...");
-                loop_wait_time = 10;
-                continue;
-            }
+        // Query the dexcom api for the latest glucose measurement
+        let Ok(measurement) = dexcom_api.get_latest_glucose(&config, &mut cache).await else {
+            // The dexcom module will log the error for us, so we can drop it and retry
+            debug!("Retrying in 10 seconds...");
+            loop_wait_time = 10;
+            continue;
         };
         
-        // Log a warning if the status update failed
-        if let Err(e) = discord_api.set_status(&status_string).await {
-            warn!("Failed to update discord account status: {e:?}");
+        // Get the measurement if it exists
+        let Some(measurement) = measurement else {
+            warn!("The API didn't return a glucose measurement");
             continue;
+        };
+        
+        trace!("Successfully got glucose measurement: {} mg/dL", measurement.value);
+        
+        // Only update the discord account status if the value has changed
+        if measurement.value != last_value {
+            
+            // Format the status string
+            let status_string = format_status(measurement.value);
+
+            // Log a warning if the status update failed
+            if let Err(e) = discord_api.set_status(&status_string).await {
+                warn!("Failed to update discord account status: {e:?}");
+                continue;
+            }
+
+            // Update the last value
+            last_value = measurement.value;
         }
+        
+        // Insert the glucose measurement into the database, ignoring any errors
+        // as the database logs them, and we don't want to crash the app
+        let _ = db.insert_glucose(&config, &mut cache, measurement).await;
+        
     }
 
 }
@@ -234,7 +238,7 @@ impl Cache {
                 return;
             }
         };
-        
+
         // Write self to the cache file
         if let Err(e) = serde_json::to_writer_pretty(file, &self) {
             error!("Failed to write to the cache file: {e:?}");
