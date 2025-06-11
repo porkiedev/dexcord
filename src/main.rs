@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
         // Sleep for the specified amount of time
         tokio::time::sleep(Duration::from_secs(loop_wait_time)).await;
         // Reset the wait time to 5 minutes
-        loop_wait_time = 300;
+        loop_wait_time = 240;
 
         // Get a blood sugar measurement
         let status_string = match dexcom_api.get_latest_glucose(&config, &mut cache).await {
