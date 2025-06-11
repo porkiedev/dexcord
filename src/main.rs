@@ -79,11 +79,11 @@ async fn main() -> Result<()> {
             }
         };
         
-        // // Log a warning if the status update failed
-        // if let Err(e) = discord_api.set_status(&status_string).await {
-        //     warn!("Failed to update discord account status: {e:?}");
-        //     continue;
-        // }
+        // Log a warning if the status update failed
+        if let Err(e) = discord_api.set_status(&status_string).await {
+            warn!("Failed to update discord account status: {e:?}");
+            continue;
+        }
     }
 
 }
