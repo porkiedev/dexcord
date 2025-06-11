@@ -3,9 +3,10 @@
 //
 
 use std::{env::current_exe, fs::File, path::PathBuf};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use anyhow::{Context, Result};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
+use crate::{Cache, Config};
 
 /// The application ID
 const APPLICATION_ID: &str = "d89443d2-327c-4a6f-89e5-496bbb0317db";
@@ -23,60 +24,35 @@ const DEFAULT_MAX_COUNT: usize = 1;
 #[derive(Debug)]
 pub struct Api {
     /// The HTTP client
-    client: reqwest::Client,
-    /// The password of the account
-    password: String,
-    /// Cachable information regarding the API connection
-    cache: ApiCache
+    client: reqwest::Client
 }
 impl Api {
-    pub async fn new(username: &str, password: &str) -> Result<Self> {
+    pub async fn new(config: &Config) -> Result<Self> {
 
         // Ensure the username and password are not empty
-        if username.is_empty() { Err(Error::ArgUsername)? };
-        if password.is_empty() { Err(Error::ArgPassword)? };
+        if config.dexcom_username.is_empty() { Err(Error::ArgUsername)? };
+        if config.dexcom_password.is_empty() { Err(Error::ArgPassword)? };
 
         // Create the HTTP client
         let mut client = reqwest::Client::new();
 
-        // Try to load the cache if it exists, otherwise create a new one
-        let mut should_refresh_cache = false;
-        let cache = ApiCache::try_load_cache(username).unwrap_or_else(|| {
-            // Update the cache refresh flag
-            should_refresh_cache = true;
-            ApiCache::default()
-        });
-
         // Create an instance of self
         let mut s = Self {
-            client,
-            password: password.to_string(),
-            cache
+            client
         };
-
-        // Update the username
-        s.cache.username = username.to_string();
-
-        // Update the account and session ID cache if necessary
-        if should_refresh_cache {
-            s.cache.account_id = s.get_account_id().await?;
-            s.cache.session_id = s.get_session_id().await?;
-            // Save the cache
-            s.cache.save();
-        }
 
         Ok(s)
     }
 
     /// Queries the API for the ID of the account
-    async fn get_account_id(&self) -> Result<String> {
+    async fn get_account_id(&self, config: &Config) -> Result<String> {
         debug!("Getting account ID...");
 
         // Send the request to the API and get the response body
         let body = self.client.post(ACCOUNT_ID_URL)
         .json(&AccountIdRequest {
-            username: &self.cache.username,
-            password: &self.password,
+            username: &config.dexcom_username,
+            password: &config.dexcom_password,
             application_id: APPLICATION_ID
         })
         .send().await?
@@ -97,14 +73,15 @@ impl Api {
         }
     }
 
-    async fn get_session_id(&self) -> Result<String> {
+    /// Queries the API for a new session ID
+    async fn get_session_id(&self, config: &Config, account_id: &str) -> Result<String> {
         debug!("Getting session ID...");
 
         // Send the request to the API and get the response body
         let body = self.client.post(SESSION_ID_URL)
         .json(&SessionIdRequest {
-            account_id: &self.cache.account_id,
-            password: &self.password,
+            account_id,
+            password: &config.dexcom_password,
             application_id: APPLICATION_ID
         })
         .send().await?
@@ -125,12 +102,26 @@ impl Api {
         }
     }
 
-    pub async fn get_latest_glucose(&mut self) -> Result<Option<GlucoseMeasurement>> {
+    /// Updates the cache with the dexcom account and session ID
+    async fn update_cache(&self, config: &Config, cache: &mut Cache) -> Result<()> {
+        // Update the cache with a new account and session ID
+        cache.dexcom_account_id = self.get_account_id(config).await?;
+        cache.dexcom_session_id = self.get_session_id(config, &cache.dexcom_account_id).await?;
+        cache.save();
+        Ok(())
+    }
+
+    pub async fn get_latest_glucose(&self, config: &Config, cache: &mut Cache) -> Result<Option<GlucoseMeasurement>> {
+
+        // Update the cache if the account or session ID is missing
+        if cache.dexcom_account_id.is_empty() | cache.dexcom_session_id.is_empty() {
+            self.update_cache(config, cache).await?;
+        }
 
         // Send the request to the API and get the response body
         let body = self.client.post(MEASURE_GLUCOSE_URL)
         .json(&MeasureGlucoseRequest {
-            session_id: &self.cache.session_id,
+            session_id: &cache.dexcom_session_id,
             minutes: DEFAULT_MINUTES,
             max_count: DEFAULT_MAX_COUNT
         })
@@ -148,99 +139,20 @@ impl Api {
         // Parse the response body into an error
         else if let Ok(e) = serde_json::from_str::<ErrorResponse>(&body) {
 
-            // If the session ID just expired, try to renew it for the next request
-            if let Error::SessionInvalid = e.code {
-                self.cache.session_id = self.get_session_id().await?;
-                // Save the cache
-                self.cache.save();
+            if let Error::SessionInvalid | Error::SessionNotFound = e.code {
+                debug!("Session ID expired or invalid. Refreshing the dexcom account and session ID...");
+                self.update_cache(config, cache).await?;
+            } else {
+                error!("Failed to get glucose measurement: {e:?}");
             }
 
-            error!("Failed to get glucose measurement: {e:?}");
             Err(e.code)?
         }
         // Parse the response body into an unknown error
         else {
+            error!("Failed to get glucose measurement: {body:?}");
             Err(Error::Unknown(body))?
         }
-    }
-}
-
-/// Cachable information regarding the API. These are saved and fetched from the cache file.
-/// 
-/// - NOTE: This caches the username so we can hopefully detect if the targeted user has changed (thus requiring a cache refresh)
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct ApiCache {
-    /// The username of the account
-    username: String,
-    /// The ID of the account
-    account_id: String,
-    /// The ID of the session
-    session_id: String
-}
-impl ApiCache {
-    fn try_load_cache(username: &str) -> Option<Self> {
-        debug!("Trying to load the API cache...");
-
-        // Get the path to the cache file
-        let path = {
-            current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf()
-            .join("api_cache.json")
-        };
-        // Open the cache file
-        let file = File::open(path);
-
-        // If the file doesn't exist, or we can't open it, return None (i.e. create a new cache)
-        if let Err(e) = file {
-            warn!("Failed to open the API cache file: {e:?}");
-            return None;
-        }
-        let file = file.unwrap();
-
-        // Read the cache file
-        let cached_s: Self = serde_json::from_reader(file)
-        .context("The API cache is invalid (perhaps try deleting it)")
-        .unwrap();
-        
-        // The cache file exists but the username changed/one or more of the fields are empty.
-        // This means the cache is invalid and needs to be refreshed
-        if cached_s.username != username ||
-            cached_s.username.is_empty() ||
-            cached_s.account_id.is_empty() ||
-            cached_s.session_id.is_empty() {
-            None
-        }
-        // The cache is still valid, so return it
-        else {
-            debug!("API cache is still valid");
-            Some(cached_s)
-        }
-    }
-
-    fn save(&self) {
-        // Get the path to the cache file
-        let path = {
-            current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf()
-            .join("api_cache.json")
-        };
-        // Create the cache file
-        let file = File::create(path).unwrap();
-        // Write self to the cache file
-        serde_json::to_writer_pretty(file, &self)
-        .context("Failed to write to the API cache file")
-        .unwrap();
-    }
-}
-impl Drop for ApiCache {
-    fn drop(&mut self) {
-        self.save();
     }
 }
 
@@ -285,14 +197,14 @@ struct MeasureGlucoseRequest<'a> {
 }
 
 /// A single glucose measurement in the glucose readings response body
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct GlucoseMeasurement {
-    /// The date and time of the measurement
-    #[serde(rename = "WT")]
-    pub wt: String,
-    /// The date and time of the measurement
-    #[serde(rename = "ST")]
-    pub st: String,
+    /// The epoch of the measurement
+    #[serde(rename = "WT", deserialize_with = "deserialize_dexcom_date_string")]
+    pub wt: u64,
+    /// The epoch of the measurement
+    #[serde(rename = "ST", deserialize_with = "deserialize_dexcom_date_string")]
+    pub st: u64,
     /// The date and time of the measurement
     #[serde(rename = "DT")]
     pub dt: String,
@@ -302,6 +214,46 @@ pub struct GlucoseMeasurement {
     /// The trend of the glucose value
     #[serde(rename = "Trend")]
     pub trend: String
+}
+
+/// Used to deserialize various types into a single u64, intended to represent a unix timestamp in milliseconds.
+/// This is primarily used to deserialize the dexcom API response which returns something like `Date(1597363200000)`
+pub fn deserialize_dexcom_date_string<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct DateVisitor;
+    impl serde::de::Visitor<'_> for DateVisitor {
+        type Value = u64;
+        
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("Expected a u64, a string 'Date(u64)', or a string 'u64'")
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(value)
+        }
+
+        fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if let Some(stripped) = s.strip_prefix("Date(").and_then(|x| x.strip_suffix(")")) {
+                stripped.parse::<u64>().map_err(E::custom)
+            } else {
+                s.parse::<u64>().map_err(E::custom)
+            }
+        }
+
+        fn visit_string<E>(self, s: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            self.visit_str(&s)
+        }
+    }
+
+    deserializer.deserialize_any(DateVisitor)
 }
 
 /// An error response from the API

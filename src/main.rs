@@ -2,11 +2,12 @@
 
 pub mod discord_protocols {
     pub mod users {
-        include!(concat!(env!("OUT_DIR"), "/discord_protocols.users.rs"));
+        include!(concat!(env!("OUT_DIR"), "/discord_protos.discord_users.v1.rs"));
     }
 }
 mod dexcom;
 mod discord;
+mod database;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,7 @@ use preloaded_user_settings::{CustomStatus, StatusSettings};
 use prost::Message;
 use tracing::{debug, error, info, trace, warn, Level};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use crate::dexcom::GlucoseMeasurement;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -30,11 +32,14 @@ async fn main() -> Result<()> {
 
     // Load the config
     let config = Config::new();
+    // Load the cache
+    let mut cache = Cache::new();
 
     // Create the API instances
     let discord_api = discord::Api::new(&config.discord_token).await;
-    let mut dexcom_api = dexcom::Api::new(&config.dexcom_username, &config.dexcom_password).await?;
-    
+    let dexcom_api = dexcom::Api::new(&config).await?;
+    let db = database::Database::new(&config);
+
     // How long (in seconds) should we wait between each loop iteration. This is set to 5 minutes by default but
     // may be temporarily changed to something shorter if we need to query the dexcom API for a new session ID
     let mut loop_wait_time = 0;
@@ -46,7 +51,7 @@ async fn main() -> Result<()> {
         loop_wait_time = 300;
 
         // Get a blood sugar measurement
-        let status_string = match dexcom_api.get_latest_glucose().await {
+        let status_string = match dexcom_api.get_latest_glucose(&config, &mut cache).await {
             Ok(measurement) => {
 
                 // Get the measurement if it exists
@@ -54,30 +59,31 @@ async fn main() -> Result<()> {
                     warn!("The API didn't return a glucose measurement");
                     continue;
                 };
+
                 trace!("Successfully got glucose measurement: {}", measurement.value);
+                // Format the status string
+                let status_string = format_status(measurement.value);
+                // Insert the glucose measurement into the database, ignoring any errors
+                // as the database logs them, and we don't want to crash the app
+                let _ = db.insert_glucose(&config, &mut cache, measurement).await;
+
                 // Return the status string
-                format_status(measurement.value)
+                status_string
             },
             Err(e) => {
 
-                // If the session expired or is not found, just continue
-                if let Some(&dexcom::Error::SessionInvalid | &dexcom::Error::SessionNotFound) = e.downcast_ref::<dexcom::Error>() {
-                    debug!("The dexcom session ID expired. Retrying with a new session ID...");
-                    // Lower the wait time to 10 seconds so we get a new session quickly but don't spam the API
-                    loop_wait_time = 10;
-                    continue;
-                } else {
-                    error!("Failed to get latest glucose measurement: {e:?}");
-                    "Tell me to change my cgm".to_string()
-                }
+                // The dexcom module will log the error for us, so we just need to retry
+                debug!("Retrying in 10 seconds...");
+                loop_wait_time = 10;
+                continue;
             }
         };
-
-        // Log a warning if the status update failed
-        if let Err(e) = discord_api.set_status(&status_string).await {
-            warn!("Failed to update discord account status: {e:?}");
-            continue;
-        }
+        
+        // // Log a warning if the status update failed
+        // if let Err(e) = discord_api.set_status(&status_string).await {
+        //     warn!("Failed to update discord account status: {e:?}");
+        //     continue;
+        // }
     }
 
 }
@@ -96,14 +102,19 @@ fn format_status(value: u32) -> String {
 
 /// The application configuration
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct Config {
-    dexcom_username: String,
-    dexcom_password: String,
-    discord_token: String
+pub struct Config {
+    pub dexcom_username: String,
+    pub dexcom_password: String,
+    pub discord_token: String,
+    pub database_url: String,
+    pub database_namespace: String,
+    pub database_name: String,
+    pub database_username: String,
+    pub database_password: String
 }
 impl Config {
     /// Returns the existsing config file.
-    /// 
+    ///
     /// - NOTE: If there is no config file, it will create a new one and panic.
     fn new() -> Self {
         debug!("Trying to load the config file...");
@@ -120,7 +131,7 @@ impl Config {
         // Open the config file
         let file = File::open(path);
 
-        // If the file doesn't exist or we can't open it, return None (i.e. create a new config)
+        // If the file doesn't exist, or we can't open it, return None (i.e. create a new config)
         if let Err(e) = file {
             warn!("Failed to open the config file: {e:?}");
             info!("Created a new config file. Please edit it and restart the program.");
@@ -154,5 +165,84 @@ impl Config {
         serde_json::to_writer_pretty(file, &self)
         .context("Failed to write to the config file")
         .unwrap();
+    }
+}
+
+/// The global application cache
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Cache {
+    /// The ID of the provided dexcom account
+    pub dexcom_account_id: String,
+    /// The ID of the latest dexcom session
+    pub dexcom_session_id: String,
+    /// The latest auth token of the database user
+    pub db_auth_token: String,
+    /// Pending glucose measurements that need to be inserted into the database.
+    /// This should generally contain no more than 1 measurement.
+    /// If it does, you may have issues with database authentication.
+    pub pending_measurements: Vec<GlucoseMeasurement>
+}
+impl Cache {
+    /// Returns the existing cache file, or creates a new one if it doesn't exist or can't be opened
+    fn new() -> Self {
+        debug!("Trying to load the cache...");
+
+        // Get the path to the cache file
+        let path = {
+            current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .to_path_buf()
+                .join("cache.json")
+        };
+        // Open the cache file
+        let file = File::open(path);
+
+        // If the file doesn't exist, or we can't open it, return a new cache
+        let file = match file {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("Failed to open the cache file: {e:?}");
+                return Self::default();
+            }
+        };
+
+        // Deserialize and return the cache file
+        serde_json::from_reader(file)
+            .context("The cache file is invalid (perhaps try deleting it)")
+            .unwrap()
+    }
+
+    /// Saves the cache file
+    fn save(&self) {
+        // Get the path to the cache file
+        let path = {
+            current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .to_path_buf()
+                .join("cache.json")
+        };
+
+        // Create the cache file
+        let file = match File::create(path) {
+            Ok(f) => f,
+            Err(e) => {
+                error!("Failed to create the cache file: {e:?}");
+                return;
+            }
+        };
+        
+        // Write self to the cache file
+        if let Err(e) = serde_json::to_writer_pretty(file, &self) {
+            error!("Failed to write to the cache file: {e:?}");
+        }
+    }
+}
+impl Drop for Cache {
+    fn drop(&mut self) {
+        self.save();
     }
 }

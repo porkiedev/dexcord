@@ -40,7 +40,7 @@ impl Api {
 
     /// Updates the status of the account with the provided string
     pub async fn set_status(&self, text: &str) -> Result<()> {
-
+        
         // Create the status change packet
         let packet = PreloadedUserSettings {
             status: Some(StatusSettings {
@@ -51,6 +51,7 @@ impl Api {
                     emoji_name: String::new(),
                     expires_at_ms: 0, // This implies the status is permanent
                     created_at_ms: get_epoch_ms(), // It works without this, but hopefully this will help trick the API into thinking we are mere mortals
+                    label: None,
                 }),
                 show_current_game: None,
                 status_expires_at_ms: 0,
